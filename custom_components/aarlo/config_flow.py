@@ -16,6 +16,7 @@ from homeassistant.helpers.selector import SelectOptionDict, \
 from .const import (
     COMPONENT_CONFIG,
     CONF_ADD_AARLO_PREFIX,
+    CONF_SAVE_MEDIA_TO,
     CONF_TFA_HOST,
     CONF_TFA_PASSWORD,
     CONF_TFA_SOURCE,
@@ -306,8 +307,7 @@ class ArloOptionsFlowHandler(config_entries.OptionsFlow):
         if user_input is not None:
             _LOGGER.debug(f"user-input-switch={user_input}")
             self._config.update(user_input)
-            _LOGGER.debug(f"_config={self._config}")
-            return self.async_create_entry(title="", data=self._config)
+            return await self.async_step_media(None)
 
         options = self._config_entry.options
         return self.async_show_form(
@@ -329,5 +329,24 @@ class ArloOptionsFlowHandler(config_entries.OptionsFlow):
                              default=options.get("switch_snapshot_timeout", 15)): int,
                 vol.Required("switch_doorbell_silence",
                              default=options.get("switch_doorbell_silence", True)): bool,
+            })
+        )
+
+    async def async_step_media(
+            self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.FlowResult:
+
+        if user_input is not None:
+            _LOGGER.debug(f"user-input-media={user_input}")
+            self._config.update(user_input)
+            _LOGGER.debug(f"_config={self._config}")
+            return self.async_create_entry(title="", data=self._config)
+
+        options = self._config_entry.options
+        return self.async_show_form(
+            step_id="media",
+            data_schema=vol.Schema({
+                vol.Optional(CONF_SAVE_MEDIA_TO,
+                             default=options.get(CONF_SAVE_MEDIA_TO, "")): str,
             })
         )

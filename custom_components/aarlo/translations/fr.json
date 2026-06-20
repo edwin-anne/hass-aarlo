@@ -85,6 +85,16 @@
           "switch_snapshot_timeout": "Délai d'attente de la capture d'écran de la caméra",
           "switch_doorbell_silence": "Désactiver les carillons de la sonnette"
         }
+      },
+      "media": {
+        "title": "Enregistrements",
+        "description": "Sauvegarder automatiquement chaque nouvel enregistrement de mouvement en local.\nLaisser le champ vide pour désactiver. Un redémarrage de Home Assistant est nécessaire pour appliquer un changement.",
+        "data": {
+          "save_media_to": "Sauvegarder les enregistrements dans"
+        },
+        "data_description": {
+          "save_media_to": "Modèle de chemin, ex. /media/aarlo/${NN}/${F}/${t} (visible dans le panneau Média). Variables : ${NN} nom court caméra, ${N} nom, ${SN} numéro de série, ${F} date AAAA-MM-JJ, ${t} heure HH-MM-SS, ${Y}${m}${d}${H}${M}${S}, ${s} horodatage. L'extension .mp4 est ajoutée automatiquement. Vide = désactivé."
+        }
       }
     }
   },

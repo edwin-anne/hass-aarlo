@@ -85,6 +85,16 @@
           "switch_snapshot_timeout": "Camera snapshot timeout",
           "switch_doorbell_silence": "Switches to silence doorbell chimes"
         }
+      },
+      "media": {
+        "title": "Recordings",
+        "description": "Automatically save each new motion recording to local storage.\nLeave the field empty to disable. A Home Assistant restart is required to apply a change.",
+        "data": {
+          "save_media_to": "Save recordings to"
+        },
+        "data_description": {
+          "save_media_to": "Path template, e.g. /media/aarlo/${NN}/${F}/${t} (browsable in the Media panel). Placeholders: ${NN} camera slug, ${N} name, ${SN} serial, ${F} date YYYY-MM-DD, ${t} time HH-MM-SS, ${Y}${m}${d}${H}${M}${S}, ${s} epoch. The .mp4 extension is added automatically. Empty disables auto-save."
+        }
       }
     }
   },

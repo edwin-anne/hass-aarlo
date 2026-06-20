@@ -277,7 +277,8 @@ DEFAULT_OPTIONS = {
     "switch_siren_duration": 10,
     "switch_snapshot": True,
     "switch_snapshot_timeout": 15,
-    "switch_doorbell_silence": True
+    "switch_doorbell_silence": True,
+    "save_media_to": SAVE_MEDIA_TO,
 }
 
 
@@ -376,6 +377,13 @@ class BlendedCfg(object):
             options = DEFAULT_OPTIONS
 
         self._main_config = {**data, **self._main_config}
+
+        # Domain-level pyaarlo settings we also surface in the options flow.
+        # A non-empty value enables the feature and overrides the YAML/default;
+        # an empty value falls back to the YAML/default (so YAML users keep theirs).
+        if options.get(CONF_SAVE_MEDIA_TO):
+            self._main_config[CONF_SAVE_MEDIA_TO] = options[CONF_SAVE_MEDIA_TO]
+
         self._alarm_config = ALARM_SCHEMA(_extract_platform_config(options, "alarm_control_panel_"))
         self._binary_sensor_config = _extract_monitored_conditions(options, "binary_sensor_")
         self._sensor_config = _extract_monitored_conditions(options, "sensor_")
