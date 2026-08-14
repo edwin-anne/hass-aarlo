@@ -1,5 +1,6 @@
 """Config flow for Aarlo"""
 
+import asyncio
 import logging
 import voluptuous as vol
 from typing import Any
@@ -13,9 +14,12 @@ from homeassistant.core import callback
 from homeassistant.helpers.selector import SelectOptionDict, \
     SelectSelector, SelectSelectorConfig, SelectSelectorMode
 
+from pyaarlo import ArloLogin, LoginStep
+
 from .const import (
     COMPONENT_CONFIG,
     CONF_ADD_AARLO_PREFIX,
+    CONF_TFA_FACTOR_ID,
     CONF_TFA_HOST,
     CONF_TFA_PASSWORD,
     CONF_TFA_SOURCE,
@@ -27,14 +31,18 @@ from .const import (
     STATE_ALARM_ARLO_HOME,
     STATE_ALARM_ARLO_NIGHT
 )
-from .cfg import UpgradeCfg
+from .cfg import PyaarloCfg, UpgradeCfg
 
 
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_IMPORTED_NAME = "imported"
+CONF_MANUAL_TFA = "manual_tfa"
 
-# TFA types. We actually map these to the correct source/type pairing.
+# TFA types for the manual/advanced fallback. We map these to the correct
+# source/type pairing. The interactive flow (see `async_step_user`) covers
+# PUSH and NONE on its own by actually logging in and looking, so this is
+# only needed for IMAP/RESTAPI or to bypass the interactive login entirely.
 TFA_TYPES = [
     SelectOptionDict(value="NONE", label="None"),
     SelectOptionDict(value="IMAP", label="IMAP"),
@@ -47,6 +55,25 @@ TFA_SELECTOR = SelectSelector(
         mode=SelectSelectorMode.DROPDOWN,
     )
 )
+
+
+def _factor_selector(factors):
+    """Build a picker out of the real factors an account has, so the user
+    chooses "Pixel 9" or "home@example.com" rather than a blind type.
+    """
+    options = [
+        SelectOptionDict(
+            value=factor["factorId"],
+            label="{} ({})".format(
+                factor.get("displayName") or factor.get("factorNickname") or factor["factorId"],
+                factor.get("factorType", "?").title(),
+            ),
+        )
+        for factor in factors
+    ]
+    return SelectSelector(
+        SelectSelectorConfig(options=options, mode=SelectSelectorMode.LIST)
+    )
 
 
 class AarloFlowHandler(config_entries.ConfigFlow, domain=COMPONENT_DOMAIN):
@@ -69,27 +96,196 @@ class AarloFlowHandler(config_entries.ConfigFlow, domain=COMPONENT_DOMAIN):
     _tfa_host: str = ""
     _add_prefix: bool = True
 
+    # State for the interactive login (see `async_step_user` onward).
+    _login: ArloLogin | None = None
+    _chosen_factor_id: str | None = None
+    _push_task = None
+    _push_result: LoginStep | None = None
+    _flow_error: str | None = None
+
     def __init__(self):
         """Initialize the config flow."""
 
+    def _create_entry(self, tfa_type, tfa_source=None, factor_id=None):
+        """Build the config entry once we know how (or whether) 2FA is handled."""
+        config = {
+            CONF_USERNAME: self._username,
+            CONF_PASSWORD: self._password,
+            CONF_TFA_TYPE: tfa_type,
+            CONF_ADD_AARLO_PREFIX: self._add_prefix,
+        }
+        if tfa_source is not None:
+            config[CONF_TFA_SOURCE] = tfa_source
+        if factor_id is not None:
+            config[CONF_TFA_FACTOR_ID] = factor_id
+
+        _LOGGER.debug(f"aarlo-config={config}")
+        return self.async_create_entry(
+            title=f"Aarlo for {self._username}",
+            data=config
+        )
+
     async def async_step_user(self, info: dict = None):
-        """Handle user initiated flow."""
+        """Collect credentials, then actually log in and see what 2FA (if
+        any) the account needs - rather than asking the user to guess.
+        """
 
         if self.hass.data.get(COMPONENT_CONFIG):
             return self.async_abort(reason="single_instance_allowed")
 
         errors = {}
         if info is not None:
+            self._username = info[CONF_USERNAME]
+            self._password = info[CONF_PASSWORD]
+            self._add_prefix = info[CONF_ADD_AARLO_PREFIX]
 
-            # applies to all
+            if info.get(CONF_MANUAL_TFA):
+                return await self.async_step_manual_tfa()
+
+            def _begin_login():
+                login = ArloLogin(
+                    username=self._username,
+                    password=self._password,
+                    storage_dir=PyaarloCfg.default_storage_dir(self.hass),
+                )
+                return login, login.start()
+
+            self._login, step = await self.hass.async_add_executor_job(_begin_login)
+
+            if step == LoginStep.SUCCESS:
+                return self._create_entry(tfa_type="none")
+
+            if step == LoginStep.NEEDS_FACTOR:
+                return await self.async_step_choose_factor()
+
+            _LOGGER.debug(f"aarlo-login-failed={self._login.last_error}")
+            errors["base"] = "auth_failed"
+            self._login = None
+
+        data_schema = {
+            vol.Required(CONF_USERNAME, default=self._username): str,
+            vol.Required(CONF_PASSWORD, default=self._password): str,
+            vol.Required(CONF_ADD_AARLO_PREFIX, default=self._add_prefix): bool,
+            vol.Optional(CONF_MANUAL_TFA, default=False): bool,
+        }
+
+        return self.async_show_form(
+            step_id="user", data_schema=vol.Schema(data_schema), errors=errors
+        )
+
+    async def async_step_choose_factor(self, user_input: dict = None):
+        """Let the user pick which of the account's real 2FA factors to use."""
+
+        errors = {}
+        if self._flow_error is not None:
+            errors["base"] = self._flow_error
+            self._flow_error = None
+
+        if user_input is not None:
+            factor_id = user_input["factor_id"]
+            step = await self.hass.async_add_executor_job(
+                self._login.choose_factor, factor_id
+            )
+            self._chosen_factor_id = factor_id
+
+            if step == LoginStep.AWAITING_PUSH:
+                self._push_task = None
+                self._push_result = None
+                return await self.async_step_await_push()
+
+            if step == LoginStep.AWAITING_CODE:
+                return await self.async_step_enter_code()
+
+            errors["base"] = "auth_failed"
+
+        factors = self._login.factors or []
+        data_schema = {
+            vol.Required("factor_id"): _factor_selector(factors),
+        }
+        return self.async_show_form(
+            step_id="choose_factor", data_schema=vol.Schema(data_schema), errors=errors
+        )
+
+    async def async_step_await_push(self, user_input=None):
+        """Wait for the user to approve the login in the Arlo phone app."""
+
+        async def _wait_for_push():
+            step = LoginStep.AWAITING_PUSH
+            poll = self._login.cfg.tfa_push_poll
+            while step == LoginStep.AWAITING_PUSH:
+                await asyncio.sleep(poll)
+                step = await self.hass.async_add_executor_job(self._login.poll_push)
+            self._push_result = step
+
+        if self._push_task is None:
+            self._push_task = self.hass.async_create_task(_wait_for_push())
+
+        if not self._push_task.done():
+            return self.async_show_progress(
+                step_id="await_push",
+                progress_action="waiting_for_push",
+                progress_task=self._push_task,
+            )
+
+        if self._push_result == LoginStep.SUCCESS:
+            return self.async_show_progress_done(next_step_id="push_done")
+        return self.async_show_progress_done(next_step_id="push_failed")
+
+    async def async_step_push_done(self, user_input=None):
+        """The push was approved - create the entry."""
+        return self._create_entry(
+            tfa_type="push", tfa_source="push", factor_id=self._chosen_factor_id
+        )
+
+    async def async_step_push_failed(self, user_input=None):
+        """Denied or timed out - go back and let the user try again."""
+        self._push_task = None
+        self._push_result = None
+        self._flow_error = "push_failed"
+        return await self.async_step_choose_factor()
+
+    async def async_step_enter_code(self, user_input: dict = None):
+        """Collect the code Arlo emailed/texted for the chosen factor."""
+
+        errors = {}
+        if user_input is not None:
+            step = await self.hass.async_add_executor_job(
+                self._login.submit_code, user_input["code"]
+            )
+            if step == LoginStep.SUCCESS:
+                factor = next(
+                    (f for f in (self._login.factors or [])
+                     if f.get("factorId") == self._chosen_factor_id),
+                    {},
+                )
+                return self._create_entry(
+                    tfa_type=factor.get("factorType", "email").lower(),
+                    factor_id=self._chosen_factor_id,
+                )
+            errors["base"] = "wrong_code"
+
+        return self.async_show_form(
+            step_id="enter_code",
+            data_schema=vol.Schema({vol.Required("code"): str}),
+            errors=errors,
+        )
+
+    async def async_step_manual_tfa(self, info: dict = None):
+        """Advanced fallback: configure 2FA by hand instead of the
+        interactive login, e.g. to set up an unattended IMAP/REST API
+        source rather than typing a code during setup.
+        """
+
+        errors = {}
+        if info is not None:
+
             config = {
-                CONF_USERNAME: info[CONF_USERNAME],
-                CONF_PASSWORD: info[CONF_PASSWORD],
+                CONF_USERNAME: self._username,
+                CONF_PASSWORD: self._password,
                 CONF_TFA_TYPE: "none",
-                CONF_ADD_AARLO_PREFIX: info[CONF_ADD_AARLO_PREFIX]
+                CONF_ADD_AARLO_PREFIX: self._add_prefix
             }
 
-            # Lets look at what we have.
             _LOGGER.debug(f"info={info}")
             if info[CONF_TFA_TYPE] == "NONE":
                 config.update({
@@ -131,30 +327,24 @@ class AarloFlowHandler(config_entries.ConfigFlow, domain=COMPONENT_DOMAIN):
             if not errors:
                 _LOGGER.debug(f"aarlo-config={config}")
                 return self.async_create_entry(
-                    title=f"Aarlo for {info[CONF_USERNAME]}",
+                    title=f"Aarlo for {self._username}",
                     data=config
                 )
 
             # Pass broken one into the GUI.
-            self._username: str = info[CONF_USERNAME]
-            self._password: str = info[CONF_PASSWORD]
             self._tfa_username: str = info.get(CONF_TFA_USERNAME, "")
             self._tfa_password: str = info.get(CONF_TFA_PASSWORD, "")
             self._tfa_host: str = info.get(CONF_TFA_HOST, "")
-            self._add_prefix: bool = info[CONF_ADD_AARLO_PREFIX]
 
         data_schema = {
-            vol.Required(CONF_USERNAME, default=self._username): str,
-            vol.Required(CONF_PASSWORD, default=self._password): str,
             vol.Required(CONF_TFA_TYPE, default="IMAP"): TFA_SELECTOR,
             vol.Optional(CONF_TFA_USERNAME, default=self._tfa_username): str,
             vol.Optional(CONF_TFA_PASSWORD, default=self._tfa_password): str,
             vol.Optional(CONF_TFA_HOST, default=self._tfa_host): str,
-            vol.Required(CONF_ADD_AARLO_PREFIX, default=self._add_prefix): bool,
         }
 
         return self.async_show_form(
-            step_id="user", data_schema=vol.Schema(data_schema), errors=errors
+            step_id="manual_tfa", data_schema=vol.Schema(data_schema), errors=errors
         )
 
     async def async_step_import(self, import_data):

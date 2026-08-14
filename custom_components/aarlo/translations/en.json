@@ -1,24 +1,51 @@
 {
   "config": {
     "abort": {
-      "single_instance_allowed": "[%key:common::config_flow::abort::single_instance_allowed%]"
+      "single_instance_allowed": "Already configured. Only a single configuration is possible."
     },
     "error": {
+      "auth_failed": "Could not log in. Check the username and password and try again.",
+      "wrong_code": "That code was not accepted. Check it and try again.",
+      "push_failed": "The push was not approved in time, or was denied. Try again.",
       "missing_imap_fields": "Please fill in all the TFA fields for IMAP.",
       "missing_restapi_fields": "Please fill in all the TFA fields for RESTAPI."
+    },
+    "progress": {
+      "waiting_for_push": "Approve the login on your Arlo app."
     },
     "step": {
       "user": {
         "title": "Arlo Login Details",
-        "description": "Enter your Home Assistant Arlo account details.\nIf needed, enter your Two Factor Authentication details.\nTo fine tune settings, look into '/config/aarlo.yaml'.",
+        "description": "Enter your Arlo account details. If the account needs Two Factor Authentication, the next step lets you pick how - straight from your real account, no need to know which method in advance.",
         "data": {
-          "username": "[%key:common::config_flow::data::username%]",
-          "password": "[%key:common::config_flow::data::password%]",
+          "username": "Username",
+          "password": "Password",
+          "add_aarlo_prefix": "Use `aarlo_` prefix for entities",
+          "manual_tfa": "Configure Two Factor Authentication manually instead"
+        }
+      },
+      "choose_factor": {
+        "title": "Choose a Two Factor method",
+        "description": "This account needs Two Factor Authentication. Pick which of the account's own factors to use.",
+        "data": {
+          "factor_id": "Factor"
+        }
+      },
+      "enter_code": {
+        "title": "Enter the code",
+        "description": "Arlo sent a code to the factor you picked. Enter it below.",
+        "data": {
+          "code": "Code"
+        }
+      },
+      "manual_tfa": {
+        "title": "Two Factor Authentication",
+        "description": "Configure Two Factor Authentication by hand.\nTo fine tune settings, look into '/config/aarlo.yaml'.",
+        "data": {
           "tfa_type": "Two Factor Mechanism",
           "tfa_host": "TFA Host",
           "tfa_username": "TFA Username",
-          "tfa_password": "TFA Password",
-          "add_aarlo_prefix": "Use `aarlo_` prefix for entities"
+          "tfa_password": "TFA Password"
         }
       }
     }

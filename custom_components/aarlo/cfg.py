@@ -146,6 +146,7 @@ AARLO_FULL_SCHEMA = AARLO_SCHEMA.extend({
     vol.Optional(CONF_TFA_HOST, default=DEFAULT_TFA_HOST): cv.string,
     vol.Optional(CONF_TFA_USERNAME, default=DEFAULT_TFA_USERNAME): cv.string,
     vol.Optional(CONF_TFA_PASSWORD, default=DEFAULT_TFA_PASSWORD): cv.string,
+    vol.Optional(CONF_TFA_FACTOR_ID, default=None): vol.Any(cv.string, None),
 })
 
 AARLO_SCHEMA_ONLY_IN_CONFIG = [
@@ -155,7 +156,8 @@ AARLO_SCHEMA_ONLY_IN_CONFIG = [
     CONF_TFA_TYPE,
     CONF_TFA_HOST,
     CONF_TFA_USERNAME,
-    CONF_TFA_PASSWORD
+    CONF_TFA_PASSWORD,
+    CONF_TFA_FACTOR_ID,
 ]
 
 AARLO_SCHEMA_DONT_SAVE = [
@@ -166,6 +168,7 @@ AARLO_SCHEMA_DONT_SAVE = [
     CONF_TFA_HOST,
     CONF_TFA_USERNAME,
     CONF_TFA_PASSWORD,
+    CONF_TFA_FACTOR_ID,
     CONF_HIDE_DEPRECATED_SERVICES,
     CONF_HTTP_CONNECTIONS,
     CONF_HTTP_MAX_SIZE,
@@ -497,6 +500,17 @@ class PyaarloCfg(object):
     """
 
     @staticmethod
+    def default_storage_dir(hass) -> str:
+        """Where pyaarlo keeps its session/cookie files when `conf_dir` isn't
+        overridden in aarlo.yaml.
+
+        Used both by `create_options` below and by the config flow's
+        interactive login, so a session saved while setting up the
+        integration is the one the real runtime login picks back up.
+        """
+        return hass.config.config_dir + "/.aarlo"
+
+    @staticmethod
     def create_options(hass, config):
 
         # Copy over and convert time deltas.
@@ -512,7 +526,7 @@ class PyaarloCfg(object):
 
         # Fix up defaults.
         if options["storage_dir"] == "":
-            options["storage_dir"] = hass.config.config_dir + "/.aarlo"
+            options["storage_dir"] = PyaarloCfg.default_storage_dir(hass)
 
         _LOGGER.debug(f"config={config}")
         _LOGGER.debug(f"options={options}")

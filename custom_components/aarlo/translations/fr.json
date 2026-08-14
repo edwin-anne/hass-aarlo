@@ -1,24 +1,51 @@
 {
   "config": {
     "abort": {
-      "single_instance_allowed": "[%key:common::config_flow::abort::single_instance_allowed%]"
+      "single_instance_allowed": "Déjà configuré. Une seule configuration est possible."
     },
     "error": {
+      "auth_failed": "Connexion impossible. Vérifiez le nom d'utilisateur et le mot de passe, puis réessayez.",
+      "wrong_code": "Ce code n'a pas été accepté. Vérifiez-le et réessayez.",
+      "push_failed": "La notification n'a pas été approuvée à temps, ou a été refusée. Réessayez.",
       "missing_imap_fields": "Veuillez remplir tous les champs TFA pour IMAP.",
       "missing_restapi_fields": "Veuillez remplir tous les champs TFA pour RESTAPI."
+    },
+    "progress": {
+      "waiting_for_push": "Approuvez la connexion dans votre application Arlo."
     },
     "step": {
       "user": {
         "title": "Détails de Connexion Arlo",
-        "description": "Entrez les informations de votre compte Home Assistant Arlo.\nSi nécessaire, entrez les détails de votre authentification à deux facteurs.\nPour ajuster les paramètres, consultez '/config/aarlo.yaml'.",
+        "description": "Entrez les informations de votre compte Arlo. Si le compte nécessite une authentification à deux facteurs, l'étape suivante vous permet de choisir laquelle - directement depuis votre compte réel, sans avoir à connaître la méthode à l'avance.",
         "data": {
-          "username": "[%key:common::config_flow::data::username%]",
-          "password": "[%key:common::config_flow::data::password%]",
+          "username": "Nom d'utilisateur",
+          "password": "Mot de passe",
+          "add_aarlo_prefix": "Utiliser le préfixe `aarlo_` pour les entités",
+          "manual_tfa": "Configurer l'authentification à deux facteurs manuellement à la place"
+        }
+      },
+      "choose_factor": {
+        "title": "Choisissez une méthode d'authentification à deux facteurs",
+        "description": "Ce compte nécessite une authentification à deux facteurs. Choisissez lequel des facteurs du compte utiliser.",
+        "data": {
+          "factor_id": "Facteur"
+        }
+      },
+      "enter_code": {
+        "title": "Entrez le code",
+        "description": "Arlo a envoyé un code au facteur que vous avez choisi. Entrez-le ci-dessous.",
+        "data": {
+          "code": "Code"
+        }
+      },
+      "manual_tfa": {
+        "title": "Authentification à Deux Facteurs",
+        "description": "Configurez l'authentification à deux facteurs manuellement.\nPour ajuster les paramètres, consultez '/config/aarlo.yaml'.",
+        "data": {
           "tfa_type": "Authentification à Deux Facteurs",
           "tfa_host": "Hôte TFA",
           "tfa_username": "Nom d'utilisateur TFA",
-          "tfa_password": "Mot de passe TFA",
-          "add_aarlo_prefix": "Utiliser le préfixe `aarlo_` pour les entités"
+          "tfa_password": "Mot de passe TFA"
         }
       }
     }
