@@ -27,7 +27,9 @@ from homeassistant.components.camera import (
     CameraEntityFeature,
     DOMAIN as CAMERA_DOMAIN,
     SERVICE_RECORD,
-    StreamType
+    WebRTCAnswer,
+    WebRTCClientConfiguration,
+    WebRTCSendMessage,
 )
 from homeassistant.components.ffmpeg import DATA_FFMPEG
 from homeassistant.const import (
@@ -36,14 +38,16 @@ from homeassistant.const import (
     ATTR_ENTITY_ID,
     CONF_FILENAME,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_aiohttp_proxy_stream
 from homeassistant.helpers.config_validation import PLATFORM_SCHEMA
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.config_entries import ConfigEntry
+from webrtc_models import RTCIceServer
 
 import pyaarlo
+from pyaarlo.sip import ArloSipError
 from pyaarlo.constant import (
     ACTIVITY_STATE_KEY,
     CHARGER_KEY,
@@ -182,6 +186,24 @@ SCHEMA_WS_SIREN_OFF = websocket_api.BASE_COMMAND_MESSAGE_SCHEMA.extend({
 })
 
 
+def _sip_capable_cameras(arlo) -> set[str]:
+    """Return the device ids of the cameras that speak SIP/WebRTC.
+
+    Runs in an executor: the first lookup per model hits Arlo's capability
+    endpoint. A camera that can't be classified - no capability document,
+    network hiccup - is simply left off the list and keeps the RTSPS path.
+    """
+    capable = set()
+    for camera in arlo.cameras:
+        try:
+            if camera.supports_sip_streaming:
+                _LOGGER.info(f"{camera.name} supports SIP/WebRTC streaming")
+                capable.add(camera.device_id)
+        except Exception as e:
+            _LOGGER.warning(f"could not read SIP capability for {camera.name}: {e}")
+    return capable
+
+
 async def async_setup_entry(
         hass: HomeAssistant,
         _entry: ConfigEntry,
@@ -192,10 +214,15 @@ async def async_setup_entry(
     arlo = hass.data[COMPONENT_DATA]
     aarlo_config = hass.data[COMPONENT_CONFIG][COMPONENT_DOMAIN]
 
+    sip_capable = await hass.async_add_executor_job(_sip_capable_cameras, arlo)
+
     cameras = []
     cameras_with_siren = False
     for camera in arlo.cameras:
-        cameras.append(ArloCam(camera, aarlo_config, hass))
+        if camera.device_id in sip_capable:
+            cameras.append(ArloSipCam(camera, aarlo_config, hass))
+        else:
+            cameras.append(ArloCam(camera, aarlo_config, hass))
         if camera.has_capability(SIREN_STATE_KEY):
             cameras_with_siren = True
 
@@ -677,6 +704,135 @@ class ArloCam(Camera):
 
     async def async_stop_recording(self):
         return await self.hass.async_add_executor_job(self.stop_recording)
+
+
+class ArloSipCam(ArloCam):
+    """An Arlo camera that streams live video over SIP/WebRTC.
+
+    This is the engine Arlo's own apps - including my.arlo.com in a browser -
+    use for live view: SIP over a WebSocket carries the offer/answer exchange
+    and the media flows peer-to-peer over WebRTC, with no `rtsps://` relay in
+    the middle. pyaarlo handles only the signalling; the browser's own
+    `RTCPeerConnection` is the other end, so Home Assistant never touches a
+    media packet on this path.
+
+    Why a subclass rather than a flag on `ArloCam`: Home Assistant decides
+    whether a camera is a native WebRTC camera by comparing
+    `type(self).async_handle_async_webrtc_offer` against `Camera`'s, once, in
+    `Camera.__init__`. That check is class-level, so defining the override on
+    `ArloCam` would claim WebRTC for *every* Arlo camera - including the ones
+    that only speak RTSPS - and a native WebRTC camera advertises `WEB_RTC`
+    *instead of* `HLS`. The `nest` integration splits its entities for exactly
+    this reason.
+
+    Everything else - snapshots, the library, the siren, recording, and the
+    `aarlo_stream_url` websocket the Lovelace card uses - is inherited
+    unchanged and still goes over RTSPS.
+    """
+
+    def __init__(self, camera, aarlo_config, hass):
+        super().__init__(camera, aarlo_config, hass)
+        self._ice_servers: list[RTCIceServer] = []
+        self._sip_session_id: str | None = None
+
+    async def async_added_to_hass(self):
+        await super().async_added_to_hass()
+        self.hass.async_create_background_task(
+            self._async_refresh_ice_servers(),
+            f"aarlo sip ice servers {self.entity_id}",
+        )
+
+    async def _async_refresh_ice_servers(self) -> None:
+        """Re-read Arlo's published STUN/TURN servers.
+
+        Cheap - one REST call, no signalling socket - so it runs at startup
+        and again after each negotiation, keeping the TURN credentials we
+        hand the browser reasonably fresh.
+        """
+        try:
+            info = await self.hass.async_add_executor_job(self._camera.get_sip_info)
+        except Exception as e:
+            _LOGGER.debug(f"{self._attr_unique_id} could not refresh ICE servers: {e}")
+            return
+        self._ice_servers = [
+            RTCIceServer(
+                urls=server["urls"],
+                username=server.get("username"),
+                credential=server.get("credential"),
+            )
+            for server in info["ice_servers"]
+        ]
+
+    @callback
+    def _async_get_webrtc_client_configuration(self) -> WebRTCClientConfiguration:
+        """Hand the browser Arlo's own STUN/TURN servers.
+
+        Home Assistant appends whatever ICE servers it is configured with on
+        top of these, so a stale or empty list here degrades to those rather
+        than breaking the stream.
+        """
+        config = WebRTCClientConfiguration()
+        config.configuration.ice_servers.extend(self._ice_servers)
+        return config
+
+    def _negotiate_sip_stream(self, offer_sdp: str) -> str:
+        """Trade the browser's offer for Arlo's answer. Blocking; executor only."""
+        self._camera.stop_sip_stream()
+        self._camera.get_sip_info()
+        return self._camera.start_sip_stream(offer_sdp)
+
+    async def async_handle_async_webrtc_offer(
+        self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
+    ) -> None:
+        """Negotiate a live stream for the browser's offer."""
+        try:
+            answer_sdp = await self.hass.async_add_executor_job(
+                self._negotiate_sip_stream, offer_sdp
+            )
+        except ArloSipError as e:
+            raise HomeAssistantError(
+                f"SIP negotiation failed for {self._attr_name}: {e}"
+            ) from e
+
+        self._sip_session_id = session_id
+        _LOGGER.debug(f"{self._attr_unique_id} SIP session {session_id} established")
+        send_message(WebRTCAnswer(answer_sdp))
+
+        self.hass.async_create_background_task(
+            self._async_refresh_ice_servers(),
+            f"aarlo sip ice servers {self.entity_id}",
+        )
+
+    async def async_on_webrtc_candidate(self, session_id: str, candidate) -> None:
+        """Ignore trickled candidates.
+
+        Arlo's SIP proxy takes one complete offer in an INVITE and answers it
+        once; there is no channel to trickle later candidates into. The offer
+        the frontend sends already carries what it had gathered, and Arlo
+        answers with a public host candidate the browser can reach directly.
+
+        `candidate` is deliberately unannotated: its type moved from
+        `RTCIceCandidate` to `RTCIceCandidateInit` in 2024.12, and importing
+        the newer name at module scope would break the whole camera platform
+        - not just SIP - on the 2024.11 this integration still supports.
+        """
+        return
+
+    @callback
+    def close_webrtc_session(self, session_id: str) -> None:
+        """Hang up the SIP call behind a session the frontend has dropped."""
+        if self._sip_session_id == session_id:
+            self._sip_session_id = None
+            _LOGGER.debug(f"{self._attr_unique_id} closing SIP session {session_id}")
+            self.hass.async_create_task(
+                self.hass.async_add_executor_job(self._camera.stop_sip_stream)
+            )
+        super().close_webrtc_session(session_id)
+
+    async def async_will_remove_from_hass(self):
+        await super().async_will_remove_from_hass()
+        if self._sip_session_id is not None:
+            self.close_webrtc_session(self._sip_session_id)
 
 
 @websocket_api.async_response
