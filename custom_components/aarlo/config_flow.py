@@ -29,7 +29,8 @@ from .const import (
     STATE_ALARM_ARLO_ARMED,
     STATE_ALARM_ARLO_DISARMED,
     STATE_ALARM_ARLO_HOME,
-    STATE_ALARM_ARLO_NIGHT
+    STATE_ALARM_ARLO_NIGHT,
+    USER_AGENT,
 )
 from .cfg import PyaarloCfg, UpgradeCfg
 
@@ -143,10 +144,17 @@ class AarloFlowHandler(config_entries.ConfigFlow, domain=COMPONENT_DOMAIN):
                 return await self.async_step_manual_tfa()
 
             def _begin_login():
+                # Must match the user_agent the runtime integration logs in
+                # with (see PyArlo(**PyaarloCfg.create_options(...)) in
+                # __init__.py) - Arlo's trusted-browser pairing is bound to
+                # the browser identity used at pairing time, so a mismatch
+                # here makes the 14-day trust silently useless and every
+                # runtime re-login falls back to a full 2FA prompt.
                 login = ArloLogin(
                     username=self._username,
                     password=self._password,
                     storage_dir=PyaarloCfg.default_storage_dir(self.hass),
+                    user_agent=USER_AGENT,
                 )
                 return login, login.start()
 
@@ -258,8 +266,16 @@ class AarloFlowHandler(config_entries.ConfigFlow, domain=COMPONENT_DOMAIN):
                      if f.get("factorId") == self._chosen_factor_id),
                     {},
                 )
+                # No automated source can reproduce a code the user typed
+                # here once - be explicit that this factor falls back to
+                # "console" at runtime rather than silently defaulting to it
+                # (leaving tfa_source unset here used to mean pyaarlo picked
+                # its own "console" default without hass-aarlo ever deciding
+                # to, and that default blocks on stdin forever in the
+                # background event thread).
                 return self._create_entry(
                     tfa_type=factor.get("factorType", "email").lower(),
+                    tfa_source="console",
                     factor_id=self._chosen_factor_id,
                 )
             errors["base"] = "wrong_code"
