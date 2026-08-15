@@ -117,6 +117,9 @@ CAMERA_SERVICE_SNAPSHOT = CAMERA_SERVICE_SCHEMA.extend({
     vol.Required(ATTR_FILENAME): cv.template
 })
 
+ICE_GATHER_DEBOUNCE_SECONDS = 0.3
+ICE_GATHER_MAX_WAIT_SECONDS = 2.0
+
 SERVICE_REQUEST_SNAPSHOT = "camera_request_snapshot"
 SERVICE_REQUEST_SNAPSHOT_TO_FILE = "camera_request_snapshot_to_file"
 SERVICE_REQUEST_VIDEO_TO_FILE = "camera_request_video_to_file"
@@ -706,6 +709,36 @@ class ArloCam(Camera):
         return await self.hass.async_add_executor_job(self.stop_recording)
 
 
+def _merge_trickled_candidates(
+    offer_sdp: str, candidates: list[tuple[int, str]]
+) -> str:
+    """Splice trickled ICE candidates into their `m=` sections of an offer.
+
+    `candidates` is `(sdp_m_line_index, candidate_line)` pairs, `candidate_line`
+    already formatted as a bare `a=candidate:...` attribute line. Insertion
+    happens from the last `m=` section backward so earlier insertions can't
+    shift the line numbers of sections still to be processed.
+    """
+    if not candidates:
+        return offer_sdp
+
+    lines = offer_sdp.replace("\r\n", "\n").split("\n")
+    m_line_positions = [i for i, line in enumerate(lines) if line.startswith("m=")]
+
+    by_m_line: dict[int, list[str]] = {}
+    for index, line in candidates:
+        by_m_line.setdefault(index, []).append(line)
+
+    for m_line_index in reversed(range(len(m_line_positions))):
+        extra_lines = by_m_line.get(m_line_index)
+        if not extra_lines:
+            continue
+        insert_at = m_line_positions[m_line_index] + 1
+        lines[insert_at:insert_at] = extra_lines
+
+    return "\r\n".join(line for line in lines if line != "") + "\r\n"
+
+
 class ArloSipCam(ArloCam):
     """An Arlo camera that streams live video over SIP/WebRTC.
 
@@ -734,6 +767,7 @@ class ArloSipCam(ArloCam):
         super().__init__(camera, aarlo_config, hass)
         self._ice_servers: list[RTCIceServer] = []
         self._sip_session_id: str | None = None
+        self._pending_candidates: dict[str, tuple[list[tuple[int, str]], asyncio.Event]] = {}
 
     async def async_added_to_hass(self):
         await super().async_added_to_hass()
@@ -781,13 +815,43 @@ class ArloSipCam(ArloCam):
         self._camera.get_sip_info()
         return self._camera.start_sip_stream(offer_sdp)
 
+    async def _wait_for_ice_gathering(self, session_id: str) -> list[tuple[int, str]]:
+        """Buffers trickled candidates until gathering looks finished.
+
+        There's no explicit "gathering complete" signal from the frontend (see
+        the module-level comment above `ICE_GATHER_DEBOUNCE_SECONDS`), so this
+        resets a short debounce timer on every candidate and treats silence as
+        done, bounded by a hard ceiling.
+        """
+        candidates: list[tuple[int, str]] = []
+        new_candidate = asyncio.Event()
+        self._pending_candidates[session_id] = (candidates, new_candidate)
+        try:
+            deadline = self.hass.loop.time() + ICE_GATHER_MAX_WAIT_SECONDS
+            while True:
+                new_candidate.clear()
+                remaining = deadline - self.hass.loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(
+                        new_candidate.wait(), timeout=min(ICE_GATHER_DEBOUNCE_SECONDS, remaining)
+                    )
+                except asyncio.TimeoutError:
+                    break
+        finally:
+            self._pending_candidates.pop(session_id, None)
+        return candidates
+
     async def async_handle_async_webrtc_offer(
         self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
     ) -> None:
         """Negotiate a live stream for the browser's offer."""
+        candidates = await self._wait_for_ice_gathering(session_id)
+        full_offer_sdp = _merge_trickled_candidates(offer_sdp, candidates)
         try:
             answer_sdp = await self.hass.async_add_executor_job(
-                self._negotiate_sip_stream, offer_sdp
+                self._negotiate_sip_stream, full_offer_sdp
             )
         except ArloSipError as e:
             raise HomeAssistantError(
@@ -804,19 +868,28 @@ class ArloSipCam(ArloCam):
         )
 
     async def async_on_webrtc_candidate(self, session_id: str, candidate) -> None:
-        """Ignore trickled candidates.
+        """Buffers a trickled candidate for the offer still being assembled.
 
         Arlo's SIP proxy takes one complete offer in an INVITE and answers it
-        once; there is no channel to trickle later candidates into. The offer
-        the frontend sends already carries what it had gathered, and Arlo
-        answers with a public host candidate the browser can reach directly.
+        once - there is no channel to trickle candidates into after the fact.
+        So candidates arriving here are held and spliced into the offer SDP
+        by `_wait_for_ice_gathering` / `_merge_trickled_candidates` before the
+        INVITE ever goes out. Anything that arrives after that buffering
+        window has closed is too late to matter and is dropped.
 
         `candidate` is deliberately unannotated: its type moved from
         `RTCIceCandidate` to `RTCIceCandidateInit` in 2024.12, and importing
         the newer name at module scope would break the whole camera platform
         - not just SIP - on the 2024.11 this integration still supports.
         """
-        return
+        pending = self._pending_candidates.get(session_id)
+        if pending is None:
+            return
+        candidates, new_candidate = pending
+        if candidate.candidate:
+            index = candidate.sdp_m_line_index or 0
+            candidates.append((index, f"a={candidate.candidate}"))
+        new_candidate.set()
 
     @callback
     def close_webrtc_session(self, session_id: str) -> None:
